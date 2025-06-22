@@ -2,8 +2,8 @@
 
 ![Made with Python](https://img.shields.io/badge/Made%20with-Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Frontend: HTML/CSS](https://img.shields.io/badge/Frontend-HTML%2FCSS-blue?style=for-the-badge)
+![Backend: Flask](https://img.shields.io/badge/Flask-000000?logo=flask&logoColor=white)
 ![MIT License](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)
-![Status](https://img.shields.io/badge/Status-Active-brightgreen?style=for-the-badge)
 
 An advanced chatbot for preliminary medical diagnosis using open source **Mistral LLM**, **LangChain**, and **PineconeDB**. It supports:
 - Symptom-based queries  
