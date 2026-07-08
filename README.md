@@ -13,7 +13,7 @@ An advanced chatbot for preliminary medical diagnosis using open source **Llama 
 
 The backend is built using **Flask**, ensuring lightweight and responsive deployment.
 
-![Architecture Diagram](https://github.com/Mozeel-V/medical-chatbot/tree/main/static/arch.drawio)
+![Architecture Diagram](architecture.drawio)
 
 ---
 
