@@ -1,0 +1,221 @@
+import os
+from dataclasses import dataclass
+from typing import Any
+
+from dotenv import load_dotenv
+from flask import Flask, jsonify, render_template, request
+
+from src.prompt import system_prompt
+
+load_dotenv()
+
+app = Flask(__name__)
+MAX_MESSAGE_LENGTH = 4000
+_rag_service = None
+
+
+@dataclass(slots=True)
+class RagService:
+    retriever: Any
+    chain: Any
+
+
+def _build_rag_chain():
+    from huggingface_hub import InferenceClient
+    from langchain.chains import create_retrieval_chain
+    from langchain.chains.combine_documents import create_stuff_documents_chain
+    from langchain_community.vectorstores import Pinecone as LangchainPinecone
+    from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+    from langchain_core.runnables import RunnableLambda
+
+    from src.helper import download_hugging_face_embeddings
+    from src.hybrid_retrieval import (
+        DEFAULT_BM25_INDEX_PATH,
+        DEFAULT_BM25_K,
+        DEFAULT_DENSE_K,
+        DEFAULT_HYBRID_K,
+        HybridRetriever,
+        load_bm25_index,
+    )
+    from src.llm_config import (
+        DEFAULT_LLM_MAX_NEW_TOKENS,
+        DEFAULT_LLM_MODEL_NAME,
+        DEFAULT_LLM_TEMPERATURE,
+    )
+
+    pinecone_api_key = os.environ.get("PINECONE_API_KEY")
+    huggingfacehub_api_key = os.environ.get("HUGGINGFACEHUB_API_KEY")
+
+    if not pinecone_api_key:
+        raise RuntimeError("PINECONE_API_KEY is required")
+
+    if not huggingfacehub_api_key:
+        raise RuntimeError("HUGGINGFACEHUB_API_KEY is required")
+
+    os.environ["PINECONE_API_KEY"] = pinecone_api_key
+    os.environ["HUGGINGFACEHUB_API_KEY"] = huggingfacehub_api_key
+
+    embeddings = download_hugging_face_embeddings()
+    index_name = os.environ.get("PINECONE_INDEX_NAME", "medbot")
+
+    docsearch = LangchainPinecone.from_existing_index(
+        index_name=index_name, embedding=embeddings
+    )
+
+    retrieval_mode = os.environ.get("RETRIEVAL_MODE", "dense").lower()
+    dense_k = int(os.environ.get("DENSE_TOP_K", str(DEFAULT_DENSE_K)))
+    bm25_k = int(os.environ.get("BM25_TOP_K", str(DEFAULT_BM25_K)))
+    final_k = int(os.environ.get("HYBRID_TOP_K", str(DEFAULT_HYBRID_K)))
+    bm25_index_path = os.environ.get("BM25_INDEX_PATH", str(DEFAULT_BM25_INDEX_PATH))
+
+    retriever = docsearch.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": dense_k if retrieval_mode == "hybrid" else final_k},
+    )
+
+    if retrieval_mode == "hybrid":
+        retriever = HybridRetriever(
+            dense_retriever=retriever,
+            bm25_index=load_bm25_index(bm25_index_path),
+            dense_k=dense_k,
+            bm25_k=bm25_k,
+            final_k=final_k,
+        )
+
+    llm_model_name = os.environ.get("LLM_MODEL_NAME", DEFAULT_LLM_MODEL_NAME)
+    llm_temperature = float(
+        os.environ.get("LLM_TEMPERATURE", str(DEFAULT_LLM_TEMPERATURE))
+    )
+    llm_max_new_tokens = int(
+        os.environ.get("LLM_MAX_NEW_TOKENS", str(DEFAULT_LLM_MAX_NEW_TOKENS))
+    )
+
+    hf_client = InferenceClient(model=llm_model_name, token=huggingfacehub_api_key)
+
+    def invoke_llm(prompt_value: Any) -> str:
+        role_map = {"human": "user", "ai": "assistant", "system": "system"}
+        if hasattr(prompt_value, "to_messages"):
+            messages = [
+                {
+                    "role": role_map.get(str(message.type), "user"),
+                    "content": str(message.content),
+                }
+                for message in prompt_value.to_messages()
+            ]
+        else:
+            messages = [{"role": "user", "content": str(prompt_value)}]
+
+        response = hf_client.chat_completion(
+            messages=messages,
+            max_tokens=llm_max_new_tokens,
+            temperature=llm_temperature,
+        )
+        return str(response.choices[0].message.content or "").strip()
+
+    llm = RunnableLambda(invoke_llm)
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            ("human", "{input}"),
+        ]
+    )
+
+    document_prompt = PromptTemplate.from_template(
+        "[source={source_file} page={page_number} chunk={chunk_id} "
+        "section={section_heading}] {page_content}"
+    )
+
+    question_answer_chain = create_stuff_documents_chain(
+        llm,
+        prompt,
+        document_prompt=document_prompt,
+    )
+    return RagService(
+        retriever=retriever,
+        chain=create_retrieval_chain(retriever, question_answer_chain),
+    )
+
+
+def get_rag_service():
+    configured_service = app.config.get("RAG_SERVICE")
+    if configured_service is not None:
+        return configured_service
+
+    configured_chain = app.config.get("RAG_CHAIN")
+    configured_retriever = app.config.get("RAG_RETRIEVER")
+    if configured_chain is not None:
+        return RagService(retriever=configured_retriever, chain=configured_chain)
+
+    global _rag_service
+    if _rag_service is None:
+        _rag_service = _build_rag_chain()
+
+    return _rag_service
+
+
+def _build_citations(retrieved_documents: list[Any]) -> list[dict[str, Any]]:
+    citations: list[dict[str, Any]] = []
+    seen_keys: set[tuple[Any, ...]] = set()
+
+    for document in retrieved_documents:
+        metadata = getattr(document, "metadata", {}) or {}
+        source = str(metadata.get("source_file") or metadata.get("source", "unknown"))
+        page_number = str(metadata.get("page_number") or metadata.get("page", ""))
+        chunk_id = str(metadata.get("chunk_id", ""))
+        snippet = str(getattr(document, "page_content", "")).strip()
+        if len(snippet) > 240:
+            snippet = snippet[:237].rstrip() + "..."
+
+        key = (source, page_number, chunk_id, snippet)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        citations.append(
+            {
+                "source": source,
+                "page": page_number,
+                "chunk_id": chunk_id,
+                "snippet": snippet,
+            }
+        )
+
+    return citations
+
+
+@app.route("/")
+def index():
+    return render_template("chat.html")
+
+
+@app.route("/get", methods=["GET", "POST"])
+def chat():
+    msg = request.form.get("msg") or (request.get_json(silent=True) or {}).get("msg")
+
+    if msg is None or not str(msg).strip():
+        return jsonify({"error": "Message is required."}), 400
+
+    msg = str(msg).strip()
+    if len(msg) > MAX_MESSAGE_LENGTH:
+        return jsonify({"error": "Message is too long."}), 413
+
+    try:
+        rag_service = get_rag_service()
+        retrieved_documents = []
+        if rag_service.retriever is not None:
+            retrieved_documents = rag_service.retriever.invoke(msg)
+
+        response = rag_service.chain.invoke({"input": msg})
+        return jsonify(
+            {
+                "answer": str(response["answer"]),
+                "citations": _build_citations(retrieved_documents),
+            }
+        )
+    except Exception:
+        app.logger.exception("RAG request failed")
+        return (
+            jsonify({"error": "Sorry, I could not generate an answer right now."}),
+            500,
+        )
